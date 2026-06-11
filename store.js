@@ -61,7 +61,39 @@ function marcarPago(pedido) {
   return pedido;
 }
 
+// ---- Leitura para o painel admin ----
+function listOrders() {
+  return Array.from(pedidos.values())
+    .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))
+    .map((p) => ({
+      externalId: p.externalId,
+      name: (p.payer && p.payer.name) || 'Cliente',
+      document: (p.payer && p.payer.document) || '',
+      qty: p.qty,
+      amount: p.amount,
+      status: p.status,
+      createdAt: p.createdAt,
+      paidAt: p.paidAt,
+    }));
+}
+
+function metrics() {
+  const all = Array.from(pedidos.values());
+  const paid = all.filter((p) => p.status === 'COMPLETED');
+  const hoje = new Date().toISOString().slice(0, 10);
+  const paidHoje = paid.filter((p) => (p.paidAt || '').slice(0, 10) === hoje);
+  return {
+    receitaTotal: Number(paid.reduce((s, p) => s + p.amount, 0).toFixed(2)),
+    receitaHoje: Number(paidHoje.reduce((s, p) => s + p.amount, 0).toFixed(2)),
+    titulosVendidos: paid.reduce((s, p) => s + p.qty, 0),
+    pedidosPagos: paid.length,
+    pedidosTotal: all.length,
+    pendentes: all.filter((p) => p.status === 'PENDING').length,
+  };
+}
+
 module.exports = {
   criarPedido, vincularTransacao, acharPorExternal,
   acharPorTransacao, marcarPago, gerarNumeros,
+  listOrders, metrics,
 };

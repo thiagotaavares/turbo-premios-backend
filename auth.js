@@ -52,14 +52,25 @@ function login(req, res) {
   return res.status(401).json({ error: 'Usuário ou senha incorretos.' });
 }
 
-// Middleware: exige um crachá válido
+// Middleware: exige um crachá de ADMIN válido
 function requireAdmin(req, res, next) {
   const h = req.headers.authorization || '';
   const token = h.startsWith('Bearer ') ? h.slice(7) : '';
   const payload = verify(token);
-  if (!payload) return res.status(401).json({ error: 'Sessão expirada ou inválida. Faça login novamente.' });
+  if (!payload || payload.role) return res.status(401).json({ error: 'Sessão expirada ou inválida. Faça login novamente.' });
   req.admin = payload;
   next();
 }
 
-module.exports = { login, requireAdmin, verify, sign };
+// ---- Afiliados (token com role 'aff') ----
+function signAffiliate(id) { return sign({ sub: id, role: 'aff', exp: Date.now() + TTL_MS }); }
+function requireAffiliate(req, res, next) {
+  const h = req.headers.authorization || '';
+  const token = h.startsWith('Bearer ') ? h.slice(7) : '';
+  const payload = verify(token);
+  if (!payload || payload.role !== 'aff') return res.status(401).json({ error: 'Sessão expirada. Faça login novamente.' });
+  req.affiliateId = payload.sub;
+  next();
+}
+
+module.exports = { login, requireAdmin, verify, sign, signAffiliate, requireAffiliate };

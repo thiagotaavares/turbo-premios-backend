@@ -11,8 +11,10 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const veopag = require('./veopag');
-const store = require('./store');
 const auth = require('./auth');
+// Usa banco de dados (PostgreSQL) se DATABASE_URL existir; senão, memória.
+const repo = process.env.DATABASE_URL ? require('./db') : require('./store');
+console.log(process.env.DATABASE_URL ? '\u2713 Persist\u00eancia: PostgreSQL' : '\u26a0 Persist\u00eancia: MEM\u00d3RIA (dados se perdem ao reiniciar)');
 
 const app = express();
 app.use(express.json());
@@ -37,8 +39,14 @@ app.post('/api/admin/login', auth.login);
 app.get('/api/admin/me', auth.requireAdmin, (_req, res) => res.json({ ok: true }));
 
 // Dados REAIS do painel (protegidos pelo cracha).
-app.get('/api/admin/metrics', auth.requireAdmin, (_req, res) => res.json(store.metrics()));
-app.get('/api/admin/orders', auth.requireAdmin, (_req, res) => res.json(store.listOrders()));
+app.get('/api/admin/metrics', auth.requireAdmin, async (_req, res) => {
+  try { res.json(await repo.metrics()); }
+  catch (e) { console.error('metrics:', e.message); res.status(500).json({ error: 'Erro ao ler métricas.' }); }
+});
+app.get('/api/admin/orders', auth.requireAdmin, async (_req, res) => {
+  try { res.json(await repo.listOrders()); }
+  catch (e) { console.error('orders:', e.message); res.status(500).json({ error: 'Erro ao ler pedidos.' }); }
+});
 
 /* ---------- 1) Criar cobrança PIX ---------- */
 app.post('/api/pix/criar', async (req, res) => {
@@ -56,7 +64,7 @@ app.post('/api/pix/criar', async (req, res) => {
     }
 
     const externalId = `order-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-    store.criarPedido({ externalId, qty: Number(qty), amount: valor, payer });
+    await repo.criarPedido({ externalId, qty: Number(qty), amount: valor, payer });
 
     const callbackUrl = PUBLIC_URL ? `${PUBLIC_URL}/webhooks/veopag` : undefined;
 
@@ -67,7 +75,7 @@ app.post('/api/pix/criar', async (req, res) => {
       payer,
     });
 
-    store.vincularTransacao(externalId, dep.transactionId);
+    await repo.vincularTransacao(externalId, dep.transactionId);
 
     res.json({
       transactionId: dep.transactionId,
@@ -86,7 +94,7 @@ app.post('/api/pix/criar', async (req, res) => {
 
 /* ---------- 2) Status (o site faz polling aqui) ---------- */
 app.get('/api/pix/status/:txId', async (req, res) => {
-  const pedido = store.acharPorTransacao(req.params.txId);
+  let pedido = await repo.acharPorTransacao(req.params.txId);
   if (!pedido) return res.status(404).json({ error: 'Pedido não encontrado.' });
 
   // Se o webhook ainda não chegou, tenta reconciliar consultando a VeoPag.
@@ -95,7 +103,7 @@ app.get('/api/pix/status/:txId', async (req, res) => {
       const info = await veopag.consultarDeposito({ transactionId: pedido.transactionId });
       const st = (info && (info.status || (info.data && info.data.status) || '')).toString().toUpperCase();
       if (st === 'COMPLETED' || st === 'PAID' || st === 'APPROVED') {
-        store.marcarPago(pedido);
+        pedido = await repo.marcarPago(pedido);
       }
     } catch (_) { /* ignora; o site tenta de novo no próximo polling */ }
   }
@@ -113,7 +121,7 @@ app.get('/api/pix/status/:txId', async (req, res) => {
    Handler defensivo: aceita diferentes nomes de campo. Confirme o formato
    exato na doc "Webhooks" da VeoPag e ajuste se necessário.
    ⚠️ Em produção, valide a autenticidade (assinatura/segredo ou IP whitelist). */
-app.post('/webhooks/veopag', (req, res) => {
+app.post('/webhooks/veopag', async (req, res) => {
   const b = req.body || {};
   const type = (b.type || b.transaction_type || '').toString().toLowerCase();
   const status = (b.status || (b.data && b.data.status) || '').toString().toUpperCase();
@@ -127,16 +135,23 @@ app.post('/webhooks/veopag', (req, res) => {
   const isPaid = ['COMPLETED', 'PAID', 'APPROVED'].includes(status);
   if (!isDeposit || !isPaid) return;
 
-  const pedido = (txId && store.acharPorTransacao(txId)) ||
-                 (externalId && store.acharPorExternal(externalId));
-  if (pedido) {
-    store.marcarPago(pedido);
-    console.log(`✅ Pedido pago: ${pedido.externalId} (${pedido.qty} títulos)`);
-    // TODO: aqui você dispara e-mail/WhatsApp de confirmação ao cliente.
-  } else {
-    console.warn('Webhook recebido sem pedido correspondente:', txId, externalId);
-  }
+  try {
+    const pedido = (txId && await repo.acharPorTransacao(txId)) ||
+                   (externalId && await repo.acharPorExternal(externalId));
+    if (pedido) {
+      await repo.marcarPago(pedido);
+      console.log(`✅ Pedido pago: ${pedido.externalId} (${pedido.qty} títulos)`);
+      // TODO: aqui você dispara e-mail/WhatsApp de confirmação ao cliente.
+    } else {
+      console.warn('Webhook recebido sem pedido correspondente:', txId, externalId);
+    }
+  } catch (e) { console.error('Erro no webhook:', e.message); }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Backend Turbo Prêmios ouvindo na porta ${PORT}`));
+async function start() {
+  try { if (repo.init) await repo.init(); }
+  catch (e) { console.error('Falha ao iniciar o banco:', e.message); }
+  app.listen(PORT, () => console.log(`Backend Turbo Prêmios ouvindo na porta ${PORT}`));
+}
+start();

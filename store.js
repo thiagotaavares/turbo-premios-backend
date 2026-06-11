@@ -30,7 +30,7 @@ function gerarNumeros(qty) {
   return out;
 }
 
-function criarPedido({ externalId, qty, amount, payer, raffleId, raffleName }) {
+function criarPedido({ externalId, qty, amount, payer, raffleId, raffleName, affiliateId }) {
   const pedido = {
     externalId,
     qty,
@@ -38,6 +38,7 @@ function criarPedido({ externalId, qty, amount, payer, raffleId, raffleName }) {
     payer,
     raffleId: raffleId || null,
     raffleName: raffleName || null,
+    affiliateId: affiliateId || null,
     status: 'PENDING',
     transactionId: null,
     numbers: [],
@@ -124,9 +125,36 @@ function metrics() {
   };
 }
 
+/* ---- Afiliados (memória) ---- */
+const crypto = require('crypto');
+const affiliates = [];
+const RATE = Number(process.env.COMMISSION_RATE || 0.30);
+function _rndPass(n=8){ const c='ABCDEFGHJKLMNPQRSTUVWXYZ23456789abcdefghijkmnpqrstuvwxyz'; let s=''; for(let i=0;i<n;i++) s+=c[Math.floor(Math.random()*c.length)]; return s; }
+function _code(name){ return ((name||'AF').replace(/[^a-zA-Z]/g,'').slice(0,4).toUpperCase()||'AF') + Math.random().toString(16).slice(2,6).toUpperCase(); }
+function createAffiliate({ name, email }){
+  const id='aff-'+Date.now().toString(36); const password=_rndPass(8); const code=_code(name);
+  affiliates.push({ id, name, email:(email||'').toLowerCase(), pass:password, code, must_change:true, rate:RATE, created_at:new Date().toISOString() });
+  return { id, name, email:(email||'').toLowerCase(), code, password, rate:RATE };
+}
+function affiliateById(id){ return affiliates.find(a=>a.id===id)||null; }
+function affiliateByEmail(email){ return affiliates.find(a=>a.email===(email||'').toLowerCase())||null; }
+function affiliateByCode(code){ return code ? (affiliates.find(a=>a.code===code)||null) : null; }
+function changeAffiliatePassword(id,newPass){ const a=affiliateById(id); if(a){ a.pass=newPass; a.must_change=false; } }
+function resetAffiliatePassword(id){ const a=affiliateById(id); const p=_rndPass(8); if(a){ a.pass=p; a.must_change=true; } return p; }
+function affiliateStats(id){
+  const paid=Array.from(pedidos.values()).filter(p=>p.affiliateId===id && p.status==='COMPLETED');
+  const revenue=paid.reduce((s,p)=>s+p.amount,0);
+  const clients=new Set(paid.map(p=>(p.payer&&p.payer.document)||'')).size;
+  const a=affiliateById(id); const rate=a?Number(a.rate):RATE;
+  return { clients, titles:paid.reduce((s,p)=>s+p.qty,0), revenue:Number(revenue.toFixed(2)), commission:Number((revenue*rate).toFixed(2)), rate };
+}
+function listAffiliates(){ return affiliates.map(a=>({ id:a.id,name:a.name,email:a.email,code:a.code,rate:Number(a.rate),mustChange:a.must_change,createdAt:a.created_at, ...affiliateStats(a.id) })); }
+
 module.exports = {
   criarPedido, vincularTransacao, acharPorExternal,
   acharPorTransacao, marcarPago, gerarNumeros,
   listOrders, metrics,
   listRaffles, listAllRaffles, getRaffle, createRaffle, updateRaffle,
+  createAffiliate, listAffiliates, affiliateByEmail, affiliateById,
+  affiliateByCode, changeAffiliatePassword, resetAffiliatePassword, affiliateStats,
 };

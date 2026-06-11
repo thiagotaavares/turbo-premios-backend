@@ -6,6 +6,20 @@
    Mesma interface do store.js, porém persistente.
    ============================================================ */
 const { Pool } = require('pg');
+const crypto = require('crypto');
+
+const COMMISSION_RATE = Number(process.env.COMMISSION_RATE || 0.30);
+
+function randomPassword(n = 8) {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789abcdefghijkmnpqrstuvwxyz';
+  let s = ''; const b = crypto.randomBytes(n);
+  for (let i = 0; i < n; i++) s += chars[b[i] % chars.length];
+  return s;
+}
+function makeCode(name) {
+  const base = (name || 'AF').replace(/[^a-zA-Z]/g, '').slice(0, 4).toUpperCase() || 'AF';
+  return base + crypto.randomBytes(2).toString('hex').toUpperCase();
+}
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -84,6 +98,19 @@ async function init() {
     CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
     ALTER TABLE orders ADD COLUMN IF NOT EXISTS raffle_id   TEXT;
     ALTER TABLE orders ADD COLUMN IF NOT EXISTS raffle_name TEXT;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS affiliate_id TEXT;
+
+    CREATE TABLE IF NOT EXISTS affiliates (
+      id          TEXT PRIMARY KEY,
+      name        TEXT NOT NULL,
+      email       TEXT UNIQUE NOT NULL,
+      pass        TEXT NOT NULL,
+      code        TEXT UNIQUE NOT NULL,
+      must_change BOOLEAN NOT NULL DEFAULT true,
+      rate        NUMERIC(4,3) NOT NULL DEFAULT 0.30,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS idx_orders_aff ON orders(affiliate_id);
 
     CREATE TABLE IF NOT EXISTS raffles (
       id          TEXT PRIMARY KEY,
@@ -155,14 +182,14 @@ async function updateRaffle(id, r) {
   return rowToRaffle(rows[0]);
 }
 
-async function criarPedido({ externalId, qty, amount, payer, raffleId, raffleName }) {
+async function criarPedido({ externalId, qty, amount, payer, raffleId, raffleName, affiliateId }) {
   await pool.query(
-    `INSERT INTO orders (external_id, qty, amount, payer_name, payer_doc, payer_email, payer_phone, status, raffle_id, raffle_name)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,'PENDING',$8,$9)
+    `INSERT INTO orders (external_id, qty, amount, payer_name, payer_doc, payer_email, payer_phone, status, raffle_id, raffle_name, affiliate_id)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,'PENDING',$8,$9,$10)
      ON CONFLICT (external_id) DO NOTHING`,
-    [externalId, qty, amount, payer.name || '', payer.document || '', payer.email || '', payer.phone || '', raffleId || null, raffleName || null]
+    [externalId, qty, amount, payer.name || '', payer.document || '', payer.email || '', payer.phone || '', raffleId || null, raffleName || null, affiliateId || null]
   );
-  return { externalId, qty, amount, payer, raffleId, raffleName, status: 'PENDING', numbers: [] };
+  return { externalId, qty, amount, payer, raffleId, raffleName, affiliateId, status: 'PENDING', numbers: [] };
 }
 
 async function vincularTransacao(externalId, transactionId) {
@@ -237,8 +264,84 @@ async function metrics() {
   };
 }
 
+/* ---------------- AFILIADOS ---------------- */
+async function createAffiliate({ name, email }) {
+  const id = 'aff-' + Date.now().toString(36);
+  const password = randomPassword(8);
+  let code = makeCode(name);
+  // garante código único
+  for (let i = 0; i < 5; i++) {
+    const { rows } = await pool.query('SELECT 1 FROM affiliates WHERE code=$1', [code]);
+    if (!rows[0]) break;
+    code = makeCode(name);
+  }
+  await pool.query(
+    `INSERT INTO affiliates (id,name,email,pass,code,must_change,rate) VALUES ($1,$2,$3,$4,$5,true,$6)`,
+    [id, name, email.toLowerCase(), password, code, COMMISSION_RATE]
+  );
+  // devolve a senha em texto puro UMA vez (para o admin enviar ao afiliado)
+  return { id, name, email: email.toLowerCase(), code, password, rate: COMMISSION_RATE };
+}
+
+async function listAffiliates() {
+  const { rows } = await pool.query(`SELECT * FROM affiliates ORDER BY created_at DESC`);
+  const out = [];
+  for (const a of rows) {
+    const st = await affiliateStats(a.id);
+    out.push({ id:a.id, name:a.name, email:a.email, code:a.code, rate:Number(a.rate),
+      mustChange:a.must_change, createdAt:a.created_at, ...st });
+  }
+  return out;
+}
+
+async function affiliateByEmail(email) {
+  const { rows } = await pool.query(`SELECT * FROM affiliates WHERE email=$1`, [(email||'').toLowerCase()]);
+  return rows[0] || null;
+}
+async function affiliateById(id) {
+  const { rows } = await pool.query(`SELECT * FROM affiliates WHERE id=$1`, [id]);
+  return rows[0] || null;
+}
+async function affiliateByCode(code) {
+  if (!code) return null;
+  const { rows } = await pool.query(`SELECT * FROM affiliates WHERE code=$1`, [code]);
+  return rows[0] || null;
+}
+async function changeAffiliatePassword(id, newPass) {
+  await pool.query(`UPDATE affiliates SET pass=$2, must_change=false WHERE id=$1`, [id, newPass]);
+}
+async function resetAffiliatePassword(id) {
+  const password = randomPassword(8);
+  await pool.query(`UPDATE affiliates SET pass=$2, must_change=true WHERE id=$1`, [id, password]);
+  return password;
+}
+
+// estatísticas reais do afiliado (apenas pedidos PAGOS atribuídos a ele)
+async function affiliateStats(id) {
+  const { rows } = await pool.query(`
+    SELECT
+      COUNT(DISTINCT payer_doc) FILTER (WHERE status='COMPLETED')  AS clients,
+      COALESCE(SUM(qty)    FILTER (WHERE status='COMPLETED'),0)     AS titles,
+      COALESCE(SUM(amount) FILTER (WHERE status='COMPLETED'),0)     AS revenue
+    FROM orders WHERE affiliate_id=$1
+  `, [id]);
+  const r = rows[0];
+  const aff = await affiliateById(id);
+  const rate = aff ? Number(aff.rate) : COMMISSION_RATE;
+  const revenue = Number(r.revenue);
+  return {
+    clients: Number(r.clients),
+    titles: Number(r.titles),
+    revenue: Number(revenue.toFixed(2)),
+    commission: Number((revenue * rate).toFixed(2)),
+    rate,
+  };
+}
+
 module.exports = {
   init, criarPedido, vincularTransacao, acharPorExternal,
   acharPorTransacao, marcarPago, listOrders, metrics, gerarNumeros,
   listRaffles, listAllRaffles, getRaffle, createRaffle, updateRaffle,
+  createAffiliate, listAffiliates, affiliateByEmail, affiliateById,
+  affiliateByCode, changeAffiliatePassword, resetAffiliatePassword, affiliateStats,
 };

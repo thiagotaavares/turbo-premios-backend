@@ -80,10 +80,56 @@ app.put('/api/admin/raffles/:id', auth.requireAdmin, async (req, res) => {
   } catch (e) { console.error('editar rifa:', e.message); res.status(500).json({ error: 'Erro ao salvar rifa.' }); }
 });
 
+/* ---- Afiliados (gestão pelo admin) ---- */
+app.get('/api/admin/affiliates', auth.requireAdmin, async (_req, res) => {
+  try { res.json(await repo.listAffiliates()); }
+  catch (e) { console.error('afiliados:', e.message); res.status(500).json({ error: 'Erro ao listar afiliados.' }); }
+});
+app.post('/api/admin/affiliates', auth.requireAdmin, async (req, res) => {
+  try {
+    const { name, email } = req.body || {};
+    if (!name || !email || !/\S+@\S+\.\S+/.test(email)) return res.status(400).json({ error: 'Informe nome e e-mail válidos.' });
+    if (repo.affiliateByEmail && await repo.affiliateByEmail(email)) return res.status(409).json({ error: 'Já existe um afiliado com este e-mail.' });
+    const aff = await repo.createAffiliate({ name, email });
+    res.json(aff); // inclui a senha gerada (mostrar UMA vez)
+  } catch (e) { console.error('criar afiliado:', e.message); res.status(500).json({ error: 'Erro ao criar afiliado.' }); }
+});
+app.post('/api/admin/affiliates/:id/reset', auth.requireAdmin, async (req, res) => {
+  try { const password = await repo.resetAffiliatePassword(req.params.id); res.json({ password }); }
+  catch (e) { res.status(500).json({ error: 'Erro ao redefinir senha.' }); }
+});
+
+/* ---- Painel do afiliado (login próprio) ---- */
+app.post('/api/affiliate/login', async (req, res) => {
+  try {
+    const { email, pass } = req.body || {};
+    const aff = await repo.affiliateByEmail(email || '');
+    if (!aff || aff.pass !== pass) return res.status(401).json({ error: 'E-mail ou senha incorretos.' });
+    const token = auth.signAffiliate(aff.id);
+    res.json({ token, mustChange: aff.must_change, name: aff.name, code: aff.code });
+  } catch (e) { console.error('login afiliado:', e.message); res.status(500).json({ error: 'Erro no login.' }); }
+});
+app.post('/api/affiliate/change-password', auth.requireAffiliate, async (req, res) => {
+  try {
+    const { newPass } = req.body || {};
+    if (!newPass || String(newPass).length < 6) return res.status(400).json({ error: 'A nova senha deve ter ao menos 6 caracteres.' });
+    await repo.changeAffiliatePassword(req.affiliateId, String(newPass));
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Erro ao trocar a senha.' }); }
+});
+app.get('/api/affiliate/me', auth.requireAffiliate, async (req, res) => {
+  try {
+    const aff = await repo.affiliateById(req.affiliateId);
+    if (!aff) return res.status(404).json({ error: 'Afiliado não encontrado.' });
+    const stats = await repo.affiliateStats(aff.id);
+    res.json({ name: aff.name, code: aff.code, mustChange: aff.must_change, ...stats });
+  } catch (e) { console.error('me afiliado:', e.message); res.status(500).json({ error: 'Erro ao carregar dados.' }); }
+});
+
 /* ---------- 1) Criar cobrança PIX ---------- */
 app.post('/api/pix/criar', async (req, res) => {
   try {
-    const { qty, amount, payer, raffleId } = req.body || {};
+    const { qty, amount, payer, raffleId, affiliateCode } = req.body || {};
     if (!qty || !payer || !payer.name || !payer.document) {
       return res.status(400).json({ error: 'Dados incompletos.' });
     }
@@ -100,8 +146,15 @@ app.post('/api/pix/criar', async (req, res) => {
     }
     const valor = Number((Number(qty) * preco).toFixed(2));
 
+    // Atribuição ao afiliado (pelo código de indicação), se houver.
+    let affiliateId = null;
+    if (affiliateCode && repo.affiliateByCode) {
+      try { const aff = await repo.affiliateByCode(String(affiliateCode).trim()); if (aff) affiliateId = aff.id; }
+      catch (_) {}
+    }
+
     const externalId = `order-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-    await repo.criarPedido({ externalId, qty: Number(qty), amount: valor, payer, raffleId: raffleId || null, raffleName });
+    await repo.criarPedido({ externalId, qty: Number(qty), amount: valor, payer, raffleId: raffleId || null, raffleName, affiliateId });
 
     const callbackUrl = PUBLIC_URL ? `${PUBLIC_URL}/webhooks/veopag` : undefined;
 

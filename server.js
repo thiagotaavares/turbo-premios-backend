@@ -12,6 +12,7 @@ const express = require('express');
 const cors = require('cors');
 const veopag = require('./veopag');
 const store = require('./store');
+const auth = require('./auth');
 
 const app = express();
 app.use(express.json());
@@ -24,6 +25,20 @@ const PRICE_PER_TITLE = Number(process.env.PRICE_PER_TITLE || 0.15);
 const PUBLIC_URL = process.env.PUBLIC_URL || ''; // ex.: https://api.turbopremios.com.br
 
 app.get('/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
+
+/* ============================================================
+   PAINEL ADMIN (autenticação no servidor)
+   ============================================================ */
+// Login: devolve um token (cracha) se usuário/senha conferem com as
+// variáveis de ambiente ADMIN_USER / ADMIN_PASS definidas no Render.
+app.post('/api/admin/login', auth.login);
+
+// Verifica se o cracha ainda é válido (o painel chama ao abrir).
+app.get('/api/admin/me', auth.requireAdmin, (_req, res) => res.json({ ok: true }));
+
+// Dados REAIS do painel (protegidos pelo cracha).
+app.get('/api/admin/metrics', auth.requireAdmin, (_req, res) => res.json(store.metrics()));
+app.get('/api/admin/orders', auth.requireAdmin, (_req, res) => res.json(store.listOrders()));
 
 /* ---------- 1) Criar cobrança PIX ---------- */
 app.post('/api/pix/criar', async (req, res) => {

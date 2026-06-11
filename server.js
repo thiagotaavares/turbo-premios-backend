@@ -29,6 +29,21 @@ const PUBLIC_URL = process.env.PUBLIC_URL || ''; // ex.: https://api.turbopremio
 app.get('/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
 
 /* ============================================================
+   RIFAS — públicas (o site monta a home a partir daqui)
+   ============================================================ */
+app.get('/api/raffles', async (_req, res) => {
+  try { res.json(await repo.listRaffles()); }
+  catch (e) { console.error('raffles:', e.message); res.status(500).json({ error: 'Erro ao listar rifas.' }); }
+});
+app.get('/api/raffles/:id', async (req, res) => {
+  try {
+    const r = await repo.getRaffle(req.params.id);
+    if (!r) return res.status(404).json({ error: 'Rifa não encontrada.' });
+    res.json(r);
+  } catch (e) { res.status(500).json({ error: 'Erro.' }); }
+});
+
+/* ============================================================
    PAINEL ADMIN (autenticação no servidor)
    ============================================================ */
 // Login: devolve um token (cracha) se usuário/senha conferem com as
@@ -48,23 +63,45 @@ app.get('/api/admin/orders', auth.requireAdmin, async (_req, res) => {
   catch (e) { console.error('orders:', e.message); res.status(500).json({ error: 'Erro ao ler pedidos.' }); }
 });
 
+// Gestão de rifas (protegida) — o admin cria/edita e reflete no site.
+app.get('/api/admin/raffles', auth.requireAdmin, async (_req, res) => {
+  try { res.json(await repo.listAllRaffles()); }
+  catch (e) { console.error('admin raffles:', e.message); res.status(500).json({ error: 'Erro ao listar rifas.' }); }
+});
+app.post('/api/admin/raffles', auth.requireAdmin, async (req, res) => {
+  try { res.json(await repo.createRaffle(req.body || {})); }
+  catch (e) { console.error('criar rifa:', e.message); res.status(500).json({ error: 'Erro ao criar rifa.' }); }
+});
+app.put('/api/admin/raffles/:id', auth.requireAdmin, async (req, res) => {
+  try {
+    const r = await repo.updateRaffle(req.params.id, req.body || {});
+    if (!r) return res.status(404).json({ error: 'Rifa não encontrada.' });
+    res.json(r);
+  } catch (e) { console.error('editar rifa:', e.message); res.status(500).json({ error: 'Erro ao salvar rifa.' }); }
+});
+
 /* ---------- 1) Criar cobrança PIX ---------- */
 app.post('/api/pix/criar', async (req, res) => {
   try {
-    const { qty, amount, payer } = req.body || {};
+    const { qty, amount, payer, raffleId } = req.body || {};
     if (!qty || !payer || !payer.name || !payer.document) {
       return res.status(400).json({ error: 'Dados incompletos.' });
     }
 
-    // Recalcula o valor no servidor (NUNCA confie no valor vindo do front).
-    const valor = Number((Number(qty) * PRICE_PER_TITLE).toFixed(2));
-    if (amount != null && Math.abs(Number(amount) - valor) > 0.001) {
-      // valor divergente — usamos o do servidor mesmo assim
-      console.warn('Valor do front difere do servidor:', amount, valor);
+    // Descobre o preço pela RIFA escolhida (nunca confia no valor do front).
+    let preco = PRICE_PER_TITLE;
+    let raffleName = null;
+    if (raffleId && repo.getRaffle) {
+      const rifa = await repo.getRaffle(raffleId);
+      if (!rifa) return res.status(404).json({ error: 'Rifa não encontrada.' });
+      if (rifa.status !== 'Ativa') return res.status(400).json({ error: 'Esta rifa não está disponível no momento.' });
+      preco = Number(rifa.price);
+      raffleName = rifa.name;
     }
+    const valor = Number((Number(qty) * preco).toFixed(2));
 
     const externalId = `order-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-    await repo.criarPedido({ externalId, qty: Number(qty), amount: valor, payer });
+    await repo.criarPedido({ externalId, qty: Number(qty), amount: valor, payer, raffleId: raffleId || null, raffleName });
 
     const callbackUrl = PUBLIC_URL ? `${PUBLIC_URL}/webhooks/veopag` : undefined;
 

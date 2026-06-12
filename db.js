@@ -128,6 +128,15 @@ async function init() {
       draw_date   TEXT,
       created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+
+    CREATE TABLE IF NOT EXISTS customers (
+      cpf          TEXT PRIMARY KEY,
+      name         TEXT,
+      email        TEXT,
+      phone        TEXT,
+      affiliate_id TEXT,
+      created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
   `);
 
   // Semeia as rifas iniciais só se a tabela estiver vazia
@@ -338,10 +347,69 @@ async function affiliateStats(id) {
   };
 }
 
+/* ---------------- CLIENTES (cadastrados no site) ---------------- */
+async function registerCustomer({ name, cpf, phone, email, affiliateId }) {
+  const doc = (cpf || '').replace(/\D/g, '');
+  if (!doc) return null;
+  await pool.query(
+    `INSERT INTO customers (cpf, name, email, phone, affiliate_id)
+     VALUES ($1,$2,$3,$4,$5)
+     ON CONFLICT (cpf) DO UPDATE SET
+       name = COALESCE(NULLIF(EXCLUDED.name,''), customers.name),
+       email = COALESCE(NULLIF(EXCLUDED.email,''), customers.email),
+       phone = COALESCE(NULLIF(EXCLUDED.phone,''), customers.phone),
+       affiliate_id = COALESCE(customers.affiliate_id, EXCLUDED.affiliate_id)`,
+    [doc, name || '', (email||'').toLowerCase(), phone || '', affiliateId || null]
+  );
+  return { cpf: doc };
+}
+
+// Lista TODOS os clientes cadastrados + qualquer comprador, com estatísticas de pedidos pagos.
+async function listCustomers() {
+  const { rows } = await pool.query(`
+    WITH stats AS (
+      SELECT payer_doc AS doc,
+        MAX(payer_name) AS name,
+        COUNT(*)             FILTER (WHERE status='COMPLETED') AS orders,
+        COALESCE(SUM(qty)    FILTER (WHERE status='COMPLETED'),0) AS titles,
+        COALESCE(SUM(amount) FILTER (WHERE status='COMPLETED'),0) AS spent,
+        MAX(created_at) AS last_order
+      FROM orders WHERE COALESCE(payer_doc,'') <> '' GROUP BY payer_doc
+    )
+    SELECT
+      COALESCE(c.cpf, s.doc)                        AS cpf,
+      COALESCE(NULLIF(c.name,''), s.name, 'Cliente') AS name,
+      c.email, c.phone,
+      c.created_at                                  AS registered_at,
+      COALESCE(s.orders,0)                          AS orders,
+      COALESCE(s.titles,0)                          AS titles,
+      COALESCE(s.spent,0)                           AS spent,
+      COALESCE(s.last_order, c.created_at)          AS last_at,
+      (c.cpf IS NOT NULL)                           AS registered
+    FROM customers c
+    FULL OUTER JOIN stats s ON s.doc = c.cpf
+    ORDER BY last_at DESC NULLS LAST
+    LIMIT 1000
+  `);
+  return rows.map((r) => ({
+    cpf: r.cpf,
+    name: r.name,
+    email: r.email || '',
+    phone: r.phone || '',
+    orders: Number(r.orders),
+    titles: Number(r.titles),
+    spent: Number(Number(r.spent).toFixed(2)),
+    last: r.last_at,
+    registered: !!r.registered,
+    paid: Number(r.orders) > 0,
+  }));
+}
+
 module.exports = {
   init, criarPedido, vincularTransacao, acharPorExternal,
   acharPorTransacao, marcarPago, listOrders, metrics, gerarNumeros,
   listRaffles, listAllRaffles, getRaffle, createRaffle, updateRaffle,
   createAffiliate, listAffiliates, affiliateByEmail, affiliateById,
   affiliateByCode, changeAffiliatePassword, resetAffiliatePassword, affiliateStats,
+  registerCustomer, listCustomers,
 };

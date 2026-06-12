@@ -150,6 +150,52 @@ function affiliateStats(id){
 }
 function listAffiliates(){ return affiliates.map(a=>({ id:a.id,name:a.name,email:a.email,code:a.code,rate:Number(a.rate),mustChange:a.must_change,createdAt:a.created_at, ...affiliateStats(a.id) })); }
 
+/* ---- Clientes (cadastrados no site) ---- */
+const customers = new Map(); // cpf(digits) -> { cpf, name, email, phone, affiliateId, createdAt }
+function registerCustomer({ name, cpf, phone, email, affiliateId }) {
+  const doc = (cpf || '').replace(/\D/g, '');
+  if (!doc) return null;
+  const ex = customers.get(doc) || { cpf: doc, createdAt: new Date().toISOString(), affiliateId: affiliateId || null };
+  customers.set(doc, {
+    ...ex,
+    name: name || ex.name || '',
+    email: (email || ex.email || '').toLowerCase(),
+    phone: phone || ex.phone || '',
+    affiliateId: ex.affiliateId || affiliateId || null,
+  });
+  return { cpf: doc };
+}
+function listCustomers() {
+  // agrega pedidos pagos por documento
+  const stats = {};
+  for (const p of pedidos.values()) {
+    const doc = (p.payer && p.payer.document) || '';
+    if (!doc) continue;
+    if (!stats[doc]) stats[doc] = { name:(p.payer&&p.payer.name)||'Cliente', orders:0, titles:0, spent:0, last:p.createdAt };
+    if (p.status === 'COMPLETED') { stats[doc].orders++; stats[doc].titles += p.qty; stats[doc].spent += p.amount; }
+    if (p.createdAt > stats[doc].last) stats[doc].last = p.createdAt;
+  }
+  const docs = new Set([...customers.keys(), ...Object.keys(stats)]);
+  const out = [];
+  for (const doc of docs) {
+    const c = customers.get(doc);
+    const s = stats[doc];
+    out.push({
+      cpf: doc,
+      name: (c && c.name) || (s && s.name) || 'Cliente',
+      email: (c && c.email) || '',
+      phone: (c && c.phone) || '',
+      orders: s ? s.orders : 0,
+      titles: s ? s.titles : 0,
+      spent: s ? Number(s.spent.toFixed(2)) : 0,
+      last: (s && s.last) || (c && c.createdAt) || null,
+      registered: !!c,
+      paid: s ? s.orders > 0 : false,
+    });
+  }
+  return out.sort((a,b)=> (b.last||'') < (a.last||'') ? -1 : 1);
+}
+
 module.exports = {
   criarPedido, vincularTransacao, acharPorExternal,
   acharPorTransacao, marcarPago, gerarNumeros,
@@ -157,4 +203,5 @@ module.exports = {
   listRaffles, listAllRaffles, getRaffle, createRaffle, updateRaffle,
   createAffiliate, listAffiliates, affiliateByEmail, affiliateById,
   affiliateByCode, changeAffiliatePassword, resetAffiliatePassword, affiliateStats,
+  registerCustomer, listCustomers,
 };

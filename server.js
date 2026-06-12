@@ -63,6 +63,12 @@ app.get('/api/admin/orders', auth.requireAdmin, async (_req, res) => {
   catch (e) { console.error('orders:', e.message); res.status(500).json({ error: 'Erro ao ler pedidos.' }); }
 });
 
+// Clientes: TODOS os cadastrados no site + compradores, com estatísticas.
+app.get('/api/admin/customers', auth.requireAdmin, async (_req, res) => {
+  try { res.json(repo.listCustomers ? await repo.listCustomers() : []); }
+  catch (e) { console.error('customers:', e.message); res.status(500).json({ error: 'Erro ao ler clientes.' }); }
+});
+
 // Gestão de rifas (protegida) — o admin cria/edita e reflete no site.
 app.get('/api/admin/raffles', auth.requireAdmin, async (_req, res) => {
   try { res.json(await repo.listAllRaffles()); }
@@ -126,6 +132,22 @@ app.get('/api/affiliate/me', auth.requireAffiliate, async (req, res) => {
   } catch (e) { console.error('me afiliado:', e.message); res.status(500).json({ error: 'Erro ao carregar dados.' }); }
 });
 
+/* ============================================================
+   CADASTRO DE CLIENTE (público) — o site salva quem cria conta
+   ============================================================ */
+app.post('/api/register', async (req, res) => {
+  try {
+    const { name, cpf, phone, email, affiliateCode } = req.body || {};
+    if (!name || !cpf) return res.status(400).json({ error: 'Nome e CPF são obrigatórios.' });
+    let affiliateId = null;
+    if (affiliateCode && repo.affiliateByCode) {
+      try { const aff = await repo.affiliateByCode(String(affiliateCode).trim()); if (aff) affiliateId = aff.id; } catch (_) {}
+    }
+    if (repo.registerCustomer) await repo.registerCustomer({ name, cpf, phone, email, affiliateId });
+    res.json({ ok: true });
+  } catch (e) { console.error('register:', e.message); res.status(500).json({ error: 'Erro ao cadastrar.' }); }
+});
+
 /* ---------- 1) Criar cobrança PIX ---------- */
 app.post('/api/pix/criar', async (req, res) => {
   try {
@@ -155,6 +177,10 @@ app.post('/api/pix/criar', async (req, res) => {
 
     const externalId = `order-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     await repo.criarPedido({ externalId, qty: Number(qty), amount: valor, payer, raffleId: raffleId || null, raffleName, affiliateId });
+    // registra/atualiza o cliente (aparece no painel mesmo antes de pagar)
+    if (repo.registerCustomer) {
+      try { await repo.registerCustomer({ name: payer.name, cpf: payer.document, phone: payer.phone, email: payer.email, affiliateId }); } catch (_) {}
+    }
 
     const callbackUrl = PUBLIC_URL ? `${PUBLIC_URL}/webhooks/veopag` : undefined;
 

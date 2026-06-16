@@ -137,6 +137,20 @@ async function init() {
       affiliate_id TEXT,
       created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+
+    CREATE TABLE IF NOT EXISTS withdrawals (
+      id           TEXT PRIMARY KEY,
+      affiliate_id TEXT NOT NULL,
+      holder_name  TEXT NOT NULL,
+      holder_doc   TEXT,
+      pix_key_type TEXT NOT NULL,
+      pix_key      TEXT NOT NULL,
+      amount       NUMERIC(12,2) NOT NULL,
+      status       TEXT NOT NULL DEFAULT 'PENDING',
+      created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+      paid_at      TIMESTAMPTZ
+    );
+    CREATE INDEX IF NOT EXISTS idx_withdrawals_aff ON withdrawals(affiliate_id);
   `);
 
   // Semeia as rifas iniciais só se a tabela estiver vazia
@@ -347,6 +361,74 @@ async function affiliateStats(id) {
   };
 }
 
+/* ---------------- SAQUES / PIX ---------------- */
+const MIN_WITHDRAW = Number(process.env.MIN_WITHDRAW || 50);
+const PIX_KEY_TYPES = ['cpf','cnpj','email','phone','random'];
+
+async function affiliateBalance(id) {
+  const { commission } = await affiliateStats(id);
+  const { rows } = await pool.query(`
+    SELECT
+      COALESCE(SUM(amount) FILTER (WHERE status='PAID'),0)    AS withdrawn,
+      COALESCE(SUM(amount) FILTER (WHERE status='PENDING'),0) AS pending
+    FROM withdrawals WHERE affiliate_id=$1
+  `, [id]);
+  const withdrawn = Number(rows[0].withdrawn);
+  const pending = Number(rows[0].pending);
+  const available = Math.max(0, commission - withdrawn - pending);
+  return {
+    withdrawn: Number(withdrawn.toFixed(2)),
+    pendingWithdraw: Number(pending.toFixed(2)),
+    available: Number(available.toFixed(2)),
+    minWithdraw: MIN_WITHDRAW,
+  };
+}
+async function createWithdrawal(id, { holderName, holderDoc, pixKeyType, pixKey, amount }) {
+  const amt = Number(amount);
+  if (!holderName || !pixKey || !pixKeyType) throw new Error('Preencha todos os campos.');
+  if (!PIX_KEY_TYPES.includes(pixKeyType)) throw new Error('Tipo de chave inválido.');
+  if (!(amt > 0)) throw new Error('Informe um valor válido.');
+  const bal = await affiliateBalance(id);
+  if (amt < bal.minWithdraw) throw new Error('O valor mínimo para saque é R$ ' + bal.minWithdraw.toFixed(2).replace('.',',') + '.');
+  if (amt > bal.available + 0.001) throw new Error('Valor acima do seu saldo disponível.');
+  const wid = 'wd-' + Date.now().toString(36) + crypto.randomBytes(2).toString('hex');
+  const { rows } = await pool.query(
+    `INSERT INTO withdrawals (id, affiliate_id, holder_name, holder_doc, pix_key_type, pix_key, amount, status)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,'PENDING') RETURNING *`,
+    [wid, id, String(holderName).trim(), String(holderDoc||'').trim(), pixKeyType, String(pixKey).trim(), Number(amt.toFixed(2))]
+  );
+  return rowToWithdrawal(rows[0]);
+}
+function rowToWithdrawal(r) {
+  if (!r) return null;
+  return {
+    id: r.id, affiliateId: r.affiliate_id, holderName: r.holder_name, holderDoc: r.holder_doc || '',
+    pixKeyType: r.pix_key_type, pixKey: r.pix_key, amount: Number(r.amount), status: r.status,
+    createdAt: r.created_at, paidAt: r.paid_at,
+    affiliateName: r.affiliate_name, affiliateCode: r.affiliate_code,
+  };
+}
+async function listWithdrawals(id) {
+  const { rows } = await pool.query(`SELECT * FROM withdrawals WHERE affiliate_id=$1 ORDER BY created_at DESC`, [id]);
+  return rows.map(rowToWithdrawal);
+}
+async function listAllWithdrawals() {
+  const { rows } = await pool.query(`
+    SELECT w.*, a.name AS affiliate_name, a.code AS affiliate_code
+    FROM withdrawals w LEFT JOIN affiliates a ON a.id = w.affiliate_id
+    ORDER BY w.created_at DESC LIMIT 500
+  `);
+  return rows.map(rowToWithdrawal);
+}
+async function updateWithdrawalStatus(wid, status) {
+  const st = status==='PAID' ? 'PAID' : (status==='REJECTED' ? 'REJECTED' : 'PENDING');
+  const { rows } = await pool.query(
+    `UPDATE withdrawals SET status=$2, paid_at = CASE WHEN $2='PAID' THEN now() ELSE NULL END WHERE id=$1 RETURNING *`,
+    [wid, st]
+  );
+  return rowToWithdrawal(rows[0]);
+}
+
 /* ---------------- CLIENTES (cadastrados no site) ---------------- */
 async function registerCustomer({ name, cpf, phone, email, affiliateId }) {
   const doc = (cpf || '').replace(/\D/g, '');
@@ -411,5 +493,6 @@ module.exports = {
   listRaffles, listAllRaffles, getRaffle, createRaffle, updateRaffle,
   createAffiliate, listAffiliates, affiliateByEmail, affiliateById,
   affiliateByCode, changeAffiliatePassword, resetAffiliatePassword, affiliateStats,
+  affiliateBalance, createWithdrawal, listWithdrawals, listAllWithdrawals, updateWithdrawalStatus,
   registerCustomer, listCustomers,
 };

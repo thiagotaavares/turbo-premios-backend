@@ -93,10 +93,12 @@ app.get('/api/admin/affiliates', auth.requireAdmin, async (_req, res) => {
 });
 app.post('/api/admin/affiliates', auth.requireAdmin, async (req, res) => {
   try {
-    const { name, email } = req.body || {};
+    const { name, email, parentCode } = req.body || {};
     if (!name || !email || !/\S+@\S+\.\S+/.test(email)) return res.status(400).json({ error: 'Informe nome e e-mail válidos.' });
     if (repo.affiliateByEmail && await repo.affiliateByEmail(email)) return res.status(409).json({ error: 'Já existe um afiliado com este e-mail.' });
-    const aff = await repo.createAffiliate({ name, email });
+    let parentId = null;
+    if (parentCode && repo.affiliateByCode) { try { const p = await repo.affiliateByCode(String(parentCode).trim()); if (p) parentId = p.id; } catch(_){} }
+    const aff = await repo.createAffiliate({ name, email, parentId });
     res.json(aff); // inclui a senha gerada (mostrar UMA vez)
   } catch (e) { console.error('criar afiliado:', e.message); res.status(500).json({ error: 'Erro ao criar afiliado.' }); }
 });
@@ -109,6 +111,12 @@ app.post('/api/admin/affiliates/:id/reset', auth.requireAdmin, async (req, res) 
 app.get('/api/admin/withdrawals', auth.requireAdmin, async (_req, res) => {
   try { res.json(repo.listAllWithdrawals ? await repo.listAllWithdrawals() : []); }
   catch (e) { console.error('saques admin:', e.message); res.status(500).json({ error: 'Erro ao listar saques.' }); }
+});
+
+/* ---- Cotas premiadas (relatório admin) ---- */
+app.get('/api/admin/prizes', auth.requireAdmin, async (_req, res) => {
+  try { res.json({ summary: repo.prizeSummary ? await repo.prizeSummary() : [], awards: repo.listPrizeAwards ? await repo.listPrizeAwards() : [] }); }
+  catch (e) { console.error('cotas premiadas admin:', e.message); res.status(500).json({ error: 'Erro ao listar cotas premiadas.' }); }
 });
 app.post('/api/admin/withdrawals/:id/status', auth.requireAdmin, async (req, res) => {
   try {
@@ -158,6 +166,27 @@ app.post('/api/affiliate/withdrawals', auth.requireAffiliate, async (req, res) =
     const w = await repo.createWithdrawal(req.affiliateId, { holderName, holderDoc, pixKeyType, pixKey, amount });
     res.json(w);
   } catch (e) { res.status(400).json({ error: e.message || 'Não foi possível solicitar o saque.' }); }
+});
+
+/* ---- Sub-afiliados (2º nível): auto-cadastro + rede de indicados ---- */
+app.post('/api/affiliate/register', async (req, res) => {
+  try {
+    if (!repo.registerAffiliate) return res.status(400).json({ error: 'Indisponível.' });
+    const { name, email, pass, parentCode } = req.body || {};
+    const aff = await repo.registerAffiliate({ name, email, pass, parentCode });
+    const token = auth.signAffiliate(aff.id);
+    res.json({ token, code: aff.code });
+  } catch (e) { res.status(400).json({ error: e.message || 'Não foi possível cadastrar.' }); }
+});
+app.get('/api/affiliate/network', auth.requireAffiliate, async (req, res) => {
+  try { res.json(repo.level2Stats ? await repo.level2Stats(req.affiliateId) : { subs:[], subCount:0, subRevenue:0, level2Commission:0, level2Rate:0.20 }); }
+  catch (e) { console.error('rede afiliado:', e.message); res.status(500).json({ error: 'Erro ao carregar indicados.' }); }
+});
+
+/* ---- Saldo/prêmios do cliente (cotas premiadas) ---- */
+app.get('/api/customer/:cpf/summary', async (req, res) => {
+  try { res.json(repo.customerSummary ? await repo.customerSummary(req.params.cpf) : { balance:0, prizesWon:0, prizes:[] }); }
+  catch (e) { res.status(500).json({ error: 'Erro ao carregar saldo.' }); }
 });
 
 /* ============================================================
@@ -252,11 +281,18 @@ app.get('/api/pix/status/:txId', async (req, res) => {
     } catch (_) { /* ignora; o site tenta de novo no próximo polling */ }
   }
 
+  let balance = 0; let prizes = [];
+  if (pedido.status === 'COMPLETED') {
+    prizes = pedido.prizes || [];
+    try { if (repo.customerSummary) { const cs = await repo.customerSummary((pedido.payer && pedido.payer.document) || ''); balance = cs.balance; } } catch (_) {}
+  }
   res.json({
     status: pedido.status,                    // PENDING | COMPLETED
     paid: pedido.status === 'COMPLETED',
     numbers: pedido.status === 'COMPLETED' ? pedido.numbers : [],
     qty: pedido.qty,
+    prizes,                                   // cotas premiadas ganhas neste pedido
+    balance,                                  // saldo/crédito atual do cliente
   });
 });
 

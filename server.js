@@ -105,6 +105,20 @@ app.post('/api/admin/affiliates/:id/reset', auth.requireAdmin, async (req, res) 
   catch (e) { res.status(500).json({ error: 'Erro ao redefinir senha.' }); }
 });
 
+/* ---- Saques (gestão pelo admin) ---- */
+app.get('/api/admin/withdrawals', auth.requireAdmin, async (_req, res) => {
+  try { res.json(repo.listAllWithdrawals ? await repo.listAllWithdrawals() : []); }
+  catch (e) { console.error('saques admin:', e.message); res.status(500).json({ error: 'Erro ao listar saques.' }); }
+});
+app.post('/api/admin/withdrawals/:id/status', auth.requireAdmin, async (req, res) => {
+  try {
+    const { status } = req.body || {};
+    const w = await repo.updateWithdrawalStatus(req.params.id, status);
+    if (!w) return res.status(404).json({ error: 'Saque não encontrado.' });
+    res.json(w);
+  } catch (e) { res.status(500).json({ error: 'Erro ao atualizar saque.' }); }
+});
+
 /* ---- Painel do afiliado (login próprio) ---- */
 app.post('/api/affiliate/login', async (req, res) => {
   try {
@@ -128,8 +142,22 @@ app.get('/api/affiliate/me', auth.requireAffiliate, async (req, res) => {
     const aff = await repo.affiliateById(req.affiliateId);
     if (!aff) return res.status(404).json({ error: 'Afiliado não encontrado.' });
     const stats = await repo.affiliateStats(aff.id);
-    res.json({ name: aff.name, code: aff.code, mustChange: aff.must_change, ...stats });
+    const bal = repo.affiliateBalance ? await repo.affiliateBalance(aff.id) : {};
+    res.json({ name: aff.name, code: aff.code, mustChange: aff.must_change, ...stats, ...bal });
   } catch (e) { console.error('me afiliado:', e.message); res.status(500).json({ error: 'Erro ao carregar dados.' }); }
+});
+
+/* ---- Saques do afiliado (PIX) ---- */
+app.get('/api/affiliate/withdrawals', auth.requireAffiliate, async (req, res) => {
+  try { res.json(repo.listWithdrawals ? await repo.listWithdrawals(req.affiliateId) : []); }
+  catch (e) { console.error('saques:', e.message); res.status(500).json({ error: 'Erro ao listar saques.' }); }
+});
+app.post('/api/affiliate/withdrawals', auth.requireAffiliate, async (req, res) => {
+  try {
+    const { holderName, holderDoc, pixKeyType, pixKey, amount } = req.body || {};
+    const w = await repo.createWithdrawal(req.affiliateId, { holderName, holderDoc, pixKeyType, pixKey, amount });
+    res.json(w);
+  } catch (e) { res.status(400).json({ error: e.message || 'Não foi possível solicitar o saque.' }); }
 });
 
 /* ============================================================

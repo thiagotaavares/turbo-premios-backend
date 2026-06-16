@@ -148,7 +148,52 @@ function affiliateStats(id){
   const a=affiliateById(id); const rate=a?Number(a.rate):RATE;
   return { clients, titles:paid.reduce((s,p)=>s+p.qty,0), revenue:Number(revenue.toFixed(2)), commission:Number((revenue*rate).toFixed(2)), rate };
 }
-function listAffiliates(){ return affiliates.map(a=>({ id:a.id,name:a.name,email:a.email,code:a.code,rate:Number(a.rate),mustChange:a.must_change,createdAt:a.created_at, ...affiliateStats(a.id) })); }
+function listAffiliates(){ return affiliates.map(a=>({ id:a.id,name:a.name,email:a.email,code:a.code,rate:Number(a.rate),mustChange:a.must_change,createdAt:a.created_at, ...affiliateStats(a.id), ...affiliateBalance(a.id) })); }
+
+/* ---- Saques / PIX (memória) ---- */
+const withdrawals = [];
+const MIN_WITHDRAW = Number(process.env.MIN_WITHDRAW || 50);
+const PIX_KEY_TYPES = ['cpf','cnpj','email','phone','random'];
+
+function affiliateBalance(id){
+  const { commission } = affiliateStats(id);
+  const mine = withdrawals.filter(w=>w.affiliateId===id);
+  const withdrawn = mine.filter(w=>w.status==='PAID').reduce((s,w)=>s+w.amount,0);
+  const pending   = mine.filter(w=>w.status==='PENDING').reduce((s,w)=>s+w.amount,0);
+  const available = Math.max(0, commission - withdrawn - pending);
+  return {
+    withdrawn: Number(withdrawn.toFixed(2)),
+    pendingWithdraw: Number(pending.toFixed(2)),
+    available: Number(available.toFixed(2)),
+    minWithdraw: MIN_WITHDRAW,
+  };
+}
+function createWithdrawal(id, { holderName, holderDoc, pixKeyType, pixKey, amount }){
+  const amt = Number(amount);
+  if (!holderName || !pixKey || !pixKeyType) throw new Error('Preencha todos os campos.');
+  if (!PIX_KEY_TYPES.includes(pixKeyType)) throw new Error('Tipo de chave inválido.');
+  if (!(amt > 0)) throw new Error('Informe um valor válido.');
+  const bal = affiliateBalance(id);
+  if (amt < bal.minWithdraw) throw new Error('O valor mínimo para saque é R$ ' + bal.minWithdraw.toFixed(2).replace('.',',') + '.');
+  if (amt > bal.available + 0.001) throw new Error('Valor acima do seu saldo disponível.');
+  const w = {
+    id: 'wd-' + Date.now().toString(36) + Math.random().toString(16).slice(2,5),
+    affiliateId: id,
+    holderName: String(holderName).trim(),
+    holderDoc: String(holderDoc||'').trim(),
+    pixKeyType,
+    pixKey: String(pixKey).trim(),
+    amount: Number(amt.toFixed(2)),
+    status: 'PENDING',
+    createdAt: new Date().toISOString(),
+    paidAt: null,
+  };
+  withdrawals.push(w);
+  return w;
+}
+function listWithdrawals(id){ return withdrawals.filter(w=>w.affiliateId===id).sort((a,b)=> a.createdAt<b.createdAt?1:-1); }
+function listAllWithdrawals(){ return withdrawals.slice().sort((a,b)=> a.createdAt<b.createdAt?1:-1).map(w=>{ const a=affiliateById(w.affiliateId); return { ...w, affiliateName:a?a.name:'', affiliateCode:a?a.code:'' }; }); }
+function updateWithdrawalStatus(wid, status){ const w=withdrawals.find(x=>x.id===wid); if(!w) return null; w.status = status==='PAID'?'PAID':(status==='REJECTED'?'REJECTED':'PENDING'); w.paidAt = w.status==='PAID' ? new Date().toISOString() : null; return w; }
 
 /* ---- Clientes (cadastrados no site) ---- */
 const customers = new Map(); // cpf(digits) -> { cpf, name, email, phone, affiliateId, createdAt }
@@ -203,5 +248,6 @@ module.exports = {
   listRaffles, listAllRaffles, getRaffle, createRaffle, updateRaffle,
   createAffiliate, listAffiliates, affiliateByEmail, affiliateById,
   affiliateByCode, changeAffiliatePassword, resetAffiliatePassword, affiliateStats,
+  affiliateBalance, createWithdrawal, listWithdrawals, listAllWithdrawals, updateWithdrawalStatus,
   registerCustomer, listCustomers,
 };

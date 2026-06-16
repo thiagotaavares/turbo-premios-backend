@@ -9,6 +9,7 @@ const { Pool } = require('pg');
 const crypto = require('crypto');
 
 const COMMISSION_RATE = Number(process.env.COMMISSION_RATE || 0.30);
+const LEVEL2_RATE = Number(process.env.LEVEL2_RATE || 0.20); // 2º nível: % sobre as VENDAS do indicado
 
 function randomPassword(n = 8) {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789abcdefghijkmnpqrstuvwxyz';
@@ -66,12 +67,16 @@ function rowToRaffle(r) {
     sortOrder: r.sort_order,
     image: r.image || '',
     drawDate: r.draw_date,
+    prizes: (() => { try { return r.prizes ? JSON.parse(r.prizes) : []; } catch(e){ return []; } })(),
   };
 }
+function publicRaffle(r){ if(!r) return null; const { prizes, ...rest } = r; return rest; }
+function normalizePrizesText(p){ if(!Array.isArray(p)){ try{ p=JSON.parse(p||'[]'); }catch(e){ p=[]; } } if(!Array.isArray(p)) return '[]'; return JSON.stringify(p.map(t=>({ value:Number(t.value)||0, qty:parseInt(t.qty)||0 })).filter(t=>t.value>0&&t.qty>0)); }
+function prizePoolFromText(txt){ let cfg=[]; try{ cfg=txt?JSON.parse(txt):[]; }catch(e){ cfg=[]; } const out=[]; for(const t of (Array.isArray(cfg)?cfg:[])){ const v=Number(t.value)||0,q=parseInt(t.qty)||0; for(let i=0;i<q;i++) if(v>0) out.push(v); } return out; }
 
 // Rifas iniciais (semeadas só na primeira vez)
 const SEED_RAFFLES = [
-  { id:'fan160', name:'10 Motos Fan 160 0km', edition:'#47', subtitle:'10 ganhadores. Escolha levar a moto 0km na garagem ou o valor direto na sua conta.', altPrize:'OU R$ 150 MIL NO PIX', price:0.15, total:2000000, sold:1417300, status:'Ativa', featured:true, sortOrder:0, image:'banner-fan160.png', drawDate:'2026-06-20T20:00:00' },
+  { id:'fan160', name:'10 Motos Fan 160 0km', edition:'#47', subtitle:'10 ganhadores. Escolha levar a moto 0km na garagem ou o valor direto na sua conta.', altPrize:'OU R$ 150 MIL NO PIX', price:0.15, total:2000000, sold:1417300, status:'Ativa', featured:true, sortOrder:0, image:'banner-fan160.png', drawDate:'2026-06-20T20:00:00', prizes:[{value:50,qty:30},{value:200,qty:8},{value:1000,qty:2}] },
   { id:'hilux', name:'Toyota Hilux SRX 0km', edition:'#03', subtitle:'ou R$ 280 mil no PIX', altPrize:'ou R$ 280 mil no PIX', price:0.50, total:1000000, sold:620000, status:'Ativa', featured:false, sortOrder:1, image:'banner-hilux.png', drawDate:'2026-07-15T20:00:00' },
   { id:'iphone', name:'5x iPhone 17 Pro Max', edition:'#08', subtitle:'ou R$ 8 mil cada', altPrize:'ou R$ 8 mil cada', price:0.10, total:1000000, sold:880000, status:'Ativa', featured:false, sortOrder:2, image:'banner-iphone.png', drawDate:'2026-06-30T20:00:00' },
   { id:'pix50', name:'R$ 50.000 no PIX', edition:'#12', subtitle:'sorteio relâmpago', altPrize:'na sua conta', price:0.05, total:1000000, sold:410000, status:'Ativa', featured:false, sortOrder:3, image:'banner-pix.png', drawDate:'2026-06-25T20:00:00' },
@@ -110,7 +115,9 @@ async function init() {
       rate        NUMERIC(4,3) NOT NULL DEFAULT 0.30,
       created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+    ALTER TABLE affiliates ADD COLUMN IF NOT EXISTS parent_id TEXT;
     CREATE INDEX IF NOT EXISTS idx_orders_aff ON orders(affiliate_id);
+    CREATE INDEX IF NOT EXISTS idx_aff_parent ON affiliates(parent_id);
 
     CREATE TABLE IF NOT EXISTS raffles (
       id          TEXT PRIMARY KEY,
@@ -128,6 +135,7 @@ async function init() {
       draw_date   TEXT,
       created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+    ALTER TABLE raffles ADD COLUMN IF NOT EXISTS prizes TEXT;
 
     CREATE TABLE IF NOT EXISTS customers (
       cpf          TEXT PRIMARY KEY,
@@ -137,6 +145,21 @@ async function init() {
       affiliate_id TEXT,
       created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+    ALTER TABLE customers ADD COLUMN IF NOT EXISTS balance NUMERIC(12,2) NOT NULL DEFAULT 0;
+
+    CREATE TABLE IF NOT EXISTS prize_awards (
+      id          TEXT PRIMARY KEY,
+      raffle_id   TEXT,
+      raffle_name TEXT,
+      value       NUMERIC(12,2) NOT NULL,
+      doc         TEXT,
+      name        TEXT,
+      order_id    TEXT,
+      number      TEXT,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS idx_prize_raffle ON prize_awards(raffle_id);
+    CREATE INDEX IF NOT EXISTS idx_prize_doc ON prize_awards(doc);
 
     CREATE TABLE IF NOT EXISTS withdrawals (
       id           TEXT PRIMARY KEY,
@@ -158,9 +181,9 @@ async function init() {
   if (rows[0].n === 0) {
     for (const r of SEED_RAFFLES) {
       await pool.query(
-        `INSERT INTO raffles (id,name,edition,subtitle,alt_prize,price,total,sold,status,featured,sort_order,image,draw_date)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT (id) DO NOTHING`,
-        [r.id, r.name, r.edition, r.subtitle, r.altPrize, r.price, r.total, r.sold, r.status, r.featured, r.sortOrder, r.image, r.drawDate]
+        `INSERT INTO raffles (id,name,edition,subtitle,alt_prize,price,total,sold,status,featured,sort_order,image,draw_date,prizes)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT (id) DO NOTHING`,
+        [r.id, r.name, r.edition, r.subtitle, r.altPrize, r.price, r.total, r.sold, r.status, r.featured, r.sortOrder, r.image, r.drawDate, normalizePrizesText(r.prizes)]
       );
     }
     console.log('🌱 Rifas iniciais semeadas.');
@@ -170,9 +193,9 @@ async function init() {
 
 /* ---------------- RIFAS ---------------- */
 async function listRaffles() {
-  // públicas: só ativas, ordenadas
+  // públicas: só ativas, ordenadas (sem expor a config de cotas premiadas)
   const { rows } = await pool.query(`SELECT * FROM raffles WHERE status='Ativa' ORDER BY featured DESC, sort_order ASC`);
-  return rows.map(rowToRaffle);
+  return rows.map(rowToRaffle).map(publicRaffle);
 }
 async function listAllRaffles() {
   const { rows } = await pool.query(`SELECT * FROM raffles ORDER BY featured DESC, sort_order ASC, created_at ASC`);
@@ -180,27 +203,27 @@ async function listAllRaffles() {
 }
 async function getRaffle(id) {
   const { rows } = await pool.query(`SELECT * FROM raffles WHERE id=$1`, [id]);
-  return rowToRaffle(rows[0]);
+  return publicRaffle(rowToRaffle(rows[0]));
 }
 async function createRaffle(r) {
   const id = (r.id && String(r.id)) || ('rifa-' + Date.now());
   const { rows } = await pool.query(
-    `INSERT INTO raffles (id,name,edition,subtitle,alt_prize,price,total,sold,status,featured,sort_order,image,draw_date)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
+    `INSERT INTO raffles (id,name,edition,subtitle,alt_prize,price,total,sold,status,featured,sort_order,image,draw_date,prizes)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *`,
     [id, r.name||'Nova rifa', r.edition||'#01', r.subtitle||'', r.altPrize||'', Number(r.price)||0.15,
      parseInt(r.total)||1000000, parseInt(r.sold)||0, r.status||'Ativa', !!r.featured,
-     parseInt(r.sortOrder)||99, r.image||'', r.drawDate||null]
+     parseInt(r.sortOrder)||99, r.image||'', r.drawDate||null, normalizePrizesText(r.prizes)]
   );
   return rowToRaffle(rows[0]);
 }
 async function updateRaffle(id, r) {
   const { rows } = await pool.query(
     `UPDATE raffles SET name=$2, edition=$3, subtitle=$4, alt_prize=$5, price=$6,
-       total=$7, sold=$8, status=$9, featured=$10, sort_order=$11, image=$12, draw_date=$13
+       total=$7, sold=$8, status=$9, featured=$10, sort_order=$11, image=$12, draw_date=$13, prizes=$14
      WHERE id=$1 RETURNING *`,
     [id, r.name, r.edition, r.subtitle||'', r.altPrize||'', Number(r.price)||0,
      parseInt(r.total)||0, parseInt(r.sold)||0, r.status||'Ativa', !!r.featured,
-     parseInt(r.sortOrder)||0, r.image||'', r.drawDate||null]
+     parseInt(r.sortOrder)||0, r.image||'', r.drawDate||null, normalizePrizesText(r.prizes)]
   );
   return rowToRaffle(rows[0]);
 }
@@ -240,14 +263,50 @@ async function marcarPago(pedido) {
     [pedido.externalId, JSON.stringify(numbers)]
   );
   if (rows[0]) {
-    // incrementa os títulos vendidos da rifa correspondente
+    let prizes = [];
     if (rows[0].raffle_id) {
+      // cotas premiadas na hora (usa o 'sold' ANTES de incrementar)
+      try {
+        const rf = await pool.query(`SELECT id,name,total,sold,prizes FROM raffles WHERE id=$1`, [rows[0].raffle_id]);
+        if (rf.rows[0]) prizes = await awardInstantPrizes(rf.rows[0], { ...rowToPedido(rows[0]), numbers });
+      } catch (e) { console.error('cotas premiadas:', e.message); }
       try { await pool.query(`UPDATE raffles SET sold = sold + $2 WHERE id=$1`, [rows[0].raffle_id, rows[0].qty]); }
       catch (e) { console.error('Falha ao incrementar sold da rifa:', e.message); }
     }
-    return rowToPedido(rows[0]);
+    const out = rowToPedido(rows[0]); out.prizes = prizes; return out;
   }
   return await acharPorExternal(pedido.externalId); // já estava pago
+}
+
+/* ---------------- COTAS PREMIADAS NA HORA ---------------- */
+async function awardInstantPrizes(rfRow, order){
+  const total = parseInt(rfRow.total)||0;
+  let remaining = prizePoolFromText(rfRow.prizes);
+  if (!remaining.length || total<=0) return [];
+  const { rows:aw } = await pool.query(`SELECT value FROM prize_awards WHERE raffle_id=$1`, [rfRow.id]);
+  for (const r of aw){ const i=remaining.indexOf(Number(r.value)); if(i>=0) remaining.splice(i,1); }
+  if (!remaining.length) return [];
+  remaining = remaining.sort(()=>Math.random()-0.5);
+  const soldBefore = parseInt(rfRow.sold)||0;
+  const nums = order.numbers||[];
+  const cap = Math.min(order.qty||0, nums.length, 200000);
+  const usedNums = new Set(); const wins=[];
+  for (let i=0;i<cap && remaining.length;i++){
+    const ticketsRemaining = total - (soldBefore+i);
+    if (ticketsRemaining<=0) break;
+    if (Math.random() < remaining.length/ticketsRemaining){
+      const value = remaining.shift();
+      let num=null; for(const n of nums){ if(!usedNums.has(n)){ num=n; usedNums.add(n); break; } }
+      if (num==null) num = nums[i] || String(i);
+      const id='pz-'+Date.now().toString(36)+crypto.randomBytes(2).toString('hex');
+      const doc=(order.payer&&order.payer.document)||'';
+      await pool.query(`INSERT INTO prize_awards (id,raffle_id,raffle_name,value,doc,name,order_id,number) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+        [id, rfRow.id, rfRow.name, value, doc, (order.payer&&order.payer.name)||'', order.externalId, num]);
+      await creditCustomer(doc, value);
+      wins.push({ value, number:num, raffleName:rfRow.name });
+    }
+  }
+  return wins;
 }
 
 async function listOrders() {
@@ -288,31 +347,65 @@ async function metrics() {
 }
 
 /* ---------------- AFILIADOS ---------------- */
-async function createAffiliate({ name, email }) {
+async function createAffiliate({ name, email, parentId }) {
   const id = 'aff-' + Date.now().toString(36);
   const password = randomPassword(8);
   let code = makeCode(name);
-  // garante código único
   for (let i = 0; i < 5; i++) {
     const { rows } = await pool.query('SELECT 1 FROM affiliates WHERE code=$1', [code]);
     if (!rows[0]) break;
     code = makeCode(name);
   }
   await pool.query(
-    `INSERT INTO affiliates (id,name,email,pass,code,must_change,rate) VALUES ($1,$2,$3,$4,$5,true,$6)`,
-    [id, name, email.toLowerCase(), password, code, COMMISSION_RATE]
+    `INSERT INTO affiliates (id,name,email,pass,code,must_change,rate,parent_id) VALUES ($1,$2,$3,$4,$5,true,$6,$7)`,
+    [id, name, email.toLowerCase(), password, code, COMMISSION_RATE, parentId || null]
   );
-  // devolve a senha em texto puro UMA vez (para o admin enviar ao afiliado)
   return { id, name, email: email.toLowerCase(), code, password, rate: COMMISSION_RATE };
+}
+
+// Auto-cadastro de afiliado (via link de recrutamento de outro afiliado)
+async function registerAffiliate({ name, email, pass, parentCode }) {
+  const em = (email||'').toLowerCase();
+  if (!name || name.trim().length < 2) throw new Error('Informe seu nome completo.');
+  if (!/\S+@\S+\.\S+/.test(em)) throw new Error('Informe um e-mail válido.');
+  if (!pass || String(pass).length < 6) throw new Error('A senha deve ter ao menos 6 caracteres.');
+  if (await affiliateByEmail(em)) throw new Error('Já existe um afiliado com este e-mail.');
+  let parentId = null;
+  if (parentCode) { const p = await affiliateByCode(String(parentCode).trim()); if (p) parentId = p.id; }
+  const id = 'aff-' + Date.now().toString(36);
+  let code = makeCode(name);
+  for (let i = 0; i < 5; i++) { const { rows } = await pool.query('SELECT 1 FROM affiliates WHERE code=$1', [code]); if (!rows[0]) break; code = makeCode(name); }
+  await pool.query(
+    `INSERT INTO affiliates (id,name,email,pass,code,must_change,rate,parent_id) VALUES ($1,$2,$3,$4,$5,false,$6,$7)`,
+    [id, name.trim(), em, String(pass), code, COMMISSION_RATE, parentId]
+  );
+  return { id, code };
+}
+
+// Rede de 2º nível: indicados diretos + comissão de 20% sobre as vendas deles
+async function level2Stats(id) {
+  const { rows: subs } = await pool.query(`SELECT id,name,code,email,created_at FROM affiliates WHERE parent_id=$1 ORDER BY created_at DESC`, [id]);
+  let subRevenue = 0; const list = [];
+  for (const s of subs) {
+    const st = await affiliateStats(s.id);
+    subRevenue += st.revenue;
+    list.push({ id:s.id, name:s.name, code:s.code, email:s.email, clients:st.clients, titles:st.titles, revenue:st.revenue, myCommission:Number((st.revenue*LEVEL2_RATE).toFixed(2)), createdAt:s.created_at });
+  }
+  return { subCount: subs.length, subRevenue: Number(subRevenue.toFixed(2)), level2Commission: Number((subRevenue*LEVEL2_RATE).toFixed(2)), level2Rate: LEVEL2_RATE, subs: list };
 }
 
 async function listAffiliates() {
   const { rows } = await pool.query(`SELECT * FROM affiliates ORDER BY created_at DESC`);
+  const byId = {}; rows.forEach(a => { byId[a.id] = a; });
   const out = [];
   for (const a of rows) {
     const st = await affiliateStats(a.id);
+    const bal = await affiliateBalance(a.id);
+    const parent = a.parent_id ? byId[a.parent_id] : null;
     out.push({ id:a.id, name:a.name, email:a.email, code:a.code, rate:Number(a.rate),
-      mustChange:a.must_change, createdAt:a.created_at, ...st });
+      mustChange:a.must_change, createdAt:a.created_at,
+      parentCode: parent ? parent.code : '', parentName: parent ? parent.name : '',
+      ...st, ...bal });
   }
   return out;
 }
@@ -367,6 +460,8 @@ const PIX_KEY_TYPES = ['cpf','cnpj','email','phone','random'];
 
 async function affiliateBalance(id) {
   const { commission } = await affiliateStats(id);
+  const l2 = await level2Stats(id);
+  const earnings = commission + l2.level2Commission;
   const { rows } = await pool.query(`
     SELECT
       COALESCE(SUM(amount) FILTER (WHERE status='PAID'),0)    AS withdrawn,
@@ -375,8 +470,12 @@ async function affiliateBalance(id) {
   `, [id]);
   const withdrawn = Number(rows[0].withdrawn);
   const pending = Number(rows[0].pending);
-  const available = Math.max(0, commission - withdrawn - pending);
+  const available = Math.max(0, earnings - withdrawn - pending);
   return {
+    ownCommission: Number(commission.toFixed(2)),
+    level2Commission: l2.level2Commission,
+    subRevenue: l2.subRevenue,
+    subCount: l2.subCount,
     withdrawn: Number(withdrawn.toFixed(2)),
     pendingWithdraw: Number(pending.toFixed(2)),
     available: Number(available.toFixed(2)),
@@ -430,6 +529,32 @@ async function updateWithdrawalStatus(wid, status) {
 }
 
 /* ---------------- CLIENTES (cadastrados no site) ---------------- */
+async function creditCustomer(doc, amount){
+  const d=(doc||'').replace(/\D/g,''); if(!d || !(Number(amount)>0)) return;
+  await pool.query(
+    `INSERT INTO customers (cpf, balance) VALUES ($1,$2)
+     ON CONFLICT (cpf) DO UPDATE SET balance = customers.balance + EXCLUDED.balance`,
+    [d, Number(amount)]
+  );
+}
+async function customerSummary(doc){
+  const d=(doc||'').replace(/\D/g,'');
+  const c = await pool.query(`SELECT name, balance FROM customers WHERE cpf=$1`, [d]);
+  const pr = await pool.query(`SELECT raffle_name, value, number, created_at FROM prize_awards WHERE doc=$1 ORDER BY created_at DESC`, [d]);
+  return { cpf:d, name:(c.rows[0]&&c.rows[0].name)||'', balance:Number((c.rows[0]&&c.rows[0].balance)||0), prizesWon:pr.rows.length, prizes:pr.rows.map(p=>({ raffleName:p.raffle_name, value:Number(p.value), number:p.number, at:p.created_at })) };
+}
+async function listPrizeAwards(){
+  const { rows } = await pool.query(`SELECT * FROM prize_awards ORDER BY created_at DESC LIMIT 500`);
+  return rows.map(a=>({ id:a.id, raffleName:a.raffle_name, value:Number(a.value), name:a.name, doc:a.doc, number:a.number, at:a.created_at }));
+}
+async function prizeSummary(){
+  const { rows } = await pool.query(`SELECT id,name,prizes FROM raffles`);
+  const out=[];
+  for(const rf of rows){ const pool2=prizePoolFromText(rf.prizes); if(!pool2.length) continue;
+    const aw=await pool.query(`SELECT COALESCE(SUM(value),0) AS v, COUNT(*)::int AS c FROM prize_awards WHERE raffle_id=$1`,[rf.id]);
+    out.push({ raffleId:rf.id, raffleName:rf.name, totalPrizes:pool2.length, totalValue:pool2.reduce((s,v)=>s+v,0), awardedCount:Number(aw.rows[0].c), awardedValue:Number(aw.rows[0].v) }); }
+  return out;
+}
 async function registerCustomer({ name, cpf, phone, email, affiliateId }) {
   const doc = (cpf || '').replace(/\D/g, '');
   if (!doc) return null;
@@ -491,8 +616,8 @@ module.exports = {
   init, criarPedido, vincularTransacao, acharPorExternal,
   acharPorTransacao, marcarPago, listOrders, metrics, gerarNumeros,
   listRaffles, listAllRaffles, getRaffle, createRaffle, updateRaffle,
-  createAffiliate, listAffiliates, affiliateByEmail, affiliateById,
+  createAffiliate, registerAffiliate, listAffiliates, affiliateByEmail, affiliateById,
   affiliateByCode, changeAffiliatePassword, resetAffiliatePassword, affiliateStats,
-  affiliateBalance, createWithdrawal, listWithdrawals, listAllWithdrawals, updateWithdrawalStatus,
-  registerCustomer, listCustomers,
+  affiliateBalance, level2Stats, createWithdrawal, listWithdrawals, listAllWithdrawals, updateWithdrawalStatus,
+  registerCustomer, listCustomers, customerSummary, listPrizeAwards, prizeSummary,
 };

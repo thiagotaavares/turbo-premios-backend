@@ -1,4 +1,4 @@
-[README.md](https://github.com/user-attachments/files/28862610/README.md)
+[README.md](https://github.com/user-attachments/files/29023235/README.md)
 # Backend de Pagamentos — Turbo Prêmios (VeoPag PIX)
 
 Pequeno servidor que conecta o site da rifa ao gateway **VeoPag**. Ele guarda a
